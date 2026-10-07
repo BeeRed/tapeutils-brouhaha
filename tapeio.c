@@ -117,6 +117,7 @@ static struct mtop mt_setden={ MTSETDENSITY, 0x02 };  /* density = 1600 */
 
 #define FAIL(msg) do { fprintf (stderr, msg); goto fail; } while (0)
 
+#define SCRATCH_BUF_SIZE    4096
 
 /* do a write and check the return status, punt on error */
 static void dowrite (int handle, void *buf, int len)
@@ -135,7 +136,8 @@ static void doread (int handle, void *buf, int len)
   int n;
   while(len)
     {
-      if ((n = read (handle, buf, len)) < 0)
+      n = read (handle, buf, len);
+      if (n < 0)
 	{
 	  perror("?Error on read");
 	  exit (1);
@@ -148,6 +150,16 @@ static void doread (int handle, void *buf, int len)
       buf += n;
       len -= n;
     }
+}
+static unsigned long doread_u32(int handle)
+{
+  unsigned char bytes[4];	/* 32 bits for length field(s) */
+  unsigned long ul;		/* at least 32 bits */
+
+  doread (handle, &bytes[0], 4);  /* get next 4 bytes */
+  ul =	((unsigned long)bytes[3]<<24L) | ((unsigned long)bytes[2]<<16L)|
+        ((unsigned long)bytes[1]<< 8L) |  (unsigned long)bytes[0];
+  return ul;
 }
 
 
@@ -237,13 +249,13 @@ tape_handle_t opentape (char *name, int create, int writable)
     {
       /* there's probably a better way to handle this, in case a file is really
 	 a link to a tape drive -- handler index or something? */
-      if (strncmp (name, "/dev/", 5) == 0) 
+      if (strncmp (name, "/dev/", 5) == 0)
 	{
 	  /* assume tape if starts with /dev/ */
 	  mtape->tape_type = TT_TAPE;
 	  mtape->tapefd = open (name, (writable ? O_RDWR : O_RDONLY), 0);
 	}
-      else 
+      else
 	{	/* otherwise file */
 	  mtape->tape_type = TT_IMAGE;
 	  if (strcmp (name, "-") ==0 )
@@ -283,12 +295,12 @@ tape_handle_t opentape (char *name, int create, int writable)
       host [len] = 0;			/* tack on null */
 
       /* connect to "rexec" server */
-      if ((p = index (host, '@')) == NULL) 
+      if ((p = index (host, '@')) == NULL)
 	{
 	  p = host;	/* no @, point at hostname */
 	  user = NULL;
 	}
-      else 
+      else
 	{
 	  *p++ = '\0';	/* shoot out @, point at host name */
 	  user = (*p != '\0') ? host : NULL;  /* keep non-null user */
@@ -338,12 +350,12 @@ tape_handle_t opentape (char *name, int create, int writable)
 /* close the tape drive */
 void closetape (tape_handle_t mtape)
 {
-  if (mtape->waccess) 
+  if (mtape->waccess)
     {				/* opened for create/append */
       tapemark (mtape);		/* add one more tape mark */
       				/* (should have one already) */
     }
-  if (mtape->tape_type == TT_RMT) 
+  if (mtape->tape_type == TT_RMT)
     {
       dowrite (mtape->tapefd, "C\n", 2);
       if (response (mtape) < 0)
@@ -366,7 +378,7 @@ void posnbot (tape_handle_t mtape)
 {
   if (mtape->tape_type == TT_IMAGE)
     {		/* image file */
-      if (lseek (mtape->tapefd, 0L, SEEK_SET) < 0) 
+      if (lseek (mtape->tapefd, 0L, SEEK_SET) < 0)
 	{
 	  perror("?Seek failed");
 	  exit(1);
@@ -388,13 +400,13 @@ void posneot (tape_handle_t mtape)
 {
   if (mtape->tape_type == TT_IMAGE)
     {		/* image file */
-      if (lseek (mtape->tapefd, -4L, SEEK_END) < 0) 
+      if (lseek (mtape->tapefd, -4L, SEEK_END) < 0)
 	{
 	  perror("?Seek failed");
 	  exit(1);
 	}
     }
-  else 
+  else
     {				/* local/remote tape drive */
       doioctl (mtape, & mt_bsr);	/* in case already at LEOT */
       while (1)
@@ -426,31 +438,28 @@ void posneot (tape_handle_t mtape)
 /* read a tape record, return actual length (0=tape mark) */
 int getrec (tape_handle_t mtape, void *buf, int len)
 {
-  unsigned char byte [4];		/* 32 bits for length field(s) */
-  unsigned long l;		/* at least 32 bits */
+  unsigned long curlen;		/* at least 32 bits */
+  unsigned long reclen;		/* at least 32 bits */
   int i;
-  
+
   if (mtape->tape_type == TT_IMAGE)
     {		/* image file */
-      doread (mtape->tapefd, byte, 4);	/* get record length */
-      l=((unsigned long)byte[3]<<24L)|((unsigned long)byte[2]<<16L)|
-	((unsigned long)byte[1]<<8L)|(unsigned long)byte[0];
-      /* compose into longword */
-      if (l > len)
+      reclen = doread_u32(mtape->tapefd );    /* get record length */
+      if (reclen > len)
 	goto toolong;	/* don't read if too long for buf */
-      if (l != 0)
+      if (reclen != 0)
 	{		/* get data unless tape mark */
 	  char x;
-	  doread (mtape->tapefd, buf, l);  /* read data */
-	  if ((l & 1) != 0 && (mtape->flags & TF_SIMH) != 0)
-	    doread (mtape->tapefd, &x, 1);
-	  doread (mtape->tapefd, byte, 4);  /* get trailing record length */
-	  if((((unsigned long)byte[3]<<24L)|
-	      ((unsigned long)byte[2]<<16L)|
-	      ((unsigned long)byte[1]<<8)|
-	      (unsigned long)byte[0])!=l)
+	  doread (mtape->tapefd, buf, reclen);  /* read data */
+	  if ((reclen & 1) != 0 && (mtape->flags & TF_SIMH) != 0)
+	    {
+	      doread (mtape->tapefd, &x, 1);
+	    }
+	  curlen = doread_u32(mtape->tapefd );  /* get trailing record length */
+	  if(curlen != reclen)
 	    {	/* should match */
-	      fprintf (stderr,"?Corrupt tape image\n");
+	      fprintf (stderr,"?Corrupt tape image");
+	      fprintf (stderr," reclen != curlen %lu != %lu\n", reclen, curlen);
 	      exit(1);
 	    }
 	}
@@ -461,27 +470,29 @@ int getrec (tape_handle_t mtape, void *buf, int len)
       dowrite (mtape->tapefd, mtape->netbuf, len);
       if ((i = response (mtape)) < 0)
 	{
-	  perror("?Error reading tape");
+	  perror("?Error reading rmt tape");
 	  exit(1);
 	}
-      l = i;
-      if (l)
-	doread (mtape->tapefd, buf, l);
+      reclen = i;
+      if (reclen)
+	{
+	  doread (mtape->tapefd, buf, reclen);
+	}
     }
-  else 
+  else
     {				/* local tape drive */
       if ((i = read (mtape->tapefd, buf, len)) < 0)
 	{
-	  perror("?Error reading tape");
+	  perror("?Error reading local tape");
 	  exit(1);
 	}
-      l = i;
+      reclen = i;
     }
-  return(l);
+  return(reclen);
 
  toolong:
   fprintf(stderr,"?%ld byte tape record too long for %d byte buffer\n",
-	  l,len);
+	  reclen,len);
   exit(1);
 }
 
@@ -509,7 +520,9 @@ void putrec (tape_handle_t mtape, void *buf, int len)
       dowrite (mtape->tapefd, buf, len);
     }
   else
-    dowrite (mtape->tapefd, buf, len);	/* just write the data if tape */
+    {
+      dowrite (mtape->tapefd, buf, len);	/* just write the data if tape */
+    }
 
   mtape->count += len + (mtape->bpi * 3 /5);  /* add to byte count
 						 (+0.6" tape gap) */
@@ -527,7 +540,7 @@ void tapemark (tape_handle_t mtape)
     }
   else
     {				/* local/remote tape drive */
-      if (doioctl (mtape, & mt_weof) < 0) 
+      if (doioctl (mtape, & mt_weof) < 0)
 	{
 	  perror ("?Failed writing tape mark");
 	  exit (1);
@@ -540,9 +553,9 @@ void tapemark (tape_handle_t mtape)
 /* skip records (negative for reverse) */
 void skiprec (tape_handle_t mtape, int count)
 {
-  unsigned char byte [4];		/* 32 bits for length field(s) */
-  unsigned long l;		/* at least 32 bits */
-  
+  unsigned long reclen;		/* at least 32 bits */
+  unsigned long traillen;	/* at least 32 bits */
+
   if (mtape->tape_type != TT_IMAGE)
     {
       fprintf (stderr, "?Record skip only implemented for image files");
@@ -557,29 +570,22 @@ void skiprec (tape_handle_t mtape, int count)
 
   while (count--)
     {
-      doread (mtape->tapefd, byte, 4);	/* get record length */
-
-      /* compose into longword */
-      l=((unsigned long)byte[3]<<24L)|((unsigned long)byte[2]<<16L)|
-	((unsigned long)byte[1]<<8L)|(unsigned long)byte[0];
-
-      if (l == 0)  /* hit tape mark? */
+      reclen = doread_u32(mtape->tapefd );    /* get record length */
+      if (reclen == 0)  /* hit tape mark? */
 	return;  /* note that we've effectively skipped over the tape mark */
 
       /* skip record */
-      if (lseek (mtape->tapefd, l, SEEK_CUR) < 0)
+      if (lseek (mtape->tapefd, reclen, SEEK_CUR) < 0)
 	{
 	  perror ("?Seek failed");
 	  exit (1);
 	}
 
-      doread (mtape->tapefd, byte, 4);  /* get trailing record length */
-      if((((unsigned long)byte[3]<<24L)|
-	  ((unsigned long)byte[2]<<16L)|
-	  ((unsigned long)byte[1]<<8)|
-	  (unsigned long)byte[0])!=l)
+      traillen = doread_u32(mtape->tapefd );  /* get trailing record length */
+      if(traillen != reclen)
 	{	/* should match */
-	  fprintf (stderr,"?Corrupt tape image\n");
+	  fprintf (stderr,"?Corrupt tape image");
+	  fprintf (stderr," reclen != traillen %lu != $%lu\n", reclen, traillen);
 	  exit(1);
 	}
     }
@@ -590,10 +596,10 @@ void skiprec (tape_handle_t mtape, int count)
    after the mark */
 static void skip_to_mark (tape_handle_t mtape)
 {
-  unsigned char byte [4];		/* 32 bits for length field(s) */
-  unsigned long l;		/* at least 32 bits */
+  unsigned long reclen;		/* at least 32 bits */
+  unsigned long traillen;	/* at least 32 bits */
 
-  static char scratch_buf [4096];
+  static char scratch_buf [SCRATCH_BUF_SIZE];
 
   if (mtape->tape_type != TT_IMAGE)
     {
@@ -603,19 +609,14 @@ static void skip_to_mark (tape_handle_t mtape)
 
   for (;;)
     {
-      doread (mtape->tapefd, byte, 4);	/* get record length */
-
-      /* compose into longword */
-      l=((unsigned long)byte[3]<<24L)|((unsigned long)byte[2]<<16L)|
-	((unsigned long)byte[1]<<8L)|(unsigned long)byte[0];
-
-      if (l == 0)  /* hit tape mark? */
+      reclen = doread_u32(mtape->tapefd );    /* get record length */
+      if (reclen == 0)  /* hit tape mark? */
 	return;  /* note that we've effectively skipped over the tape mark */
 
       /* skip record */
       if (mtape->seek_ok)
 	{
-	  if (lseek (mtape->tapefd, l, SEEK_CUR) < 0)
+	  if (lseek (mtape->tapefd, reclen, SEEK_CUR) < 0)
 	    {
 	      perror ("?Seek failed");
 	      exit (1);
@@ -624,7 +625,7 @@ static void skip_to_mark (tape_handle_t mtape)
       else
 	{
 	  int len, len2;
-	  len = l;
+	  len = reclen;
 	  while (len > 0)
 	    {
 	      len2 = len;
@@ -635,13 +636,11 @@ static void skip_to_mark (tape_handle_t mtape)
 	    }
 	}
 
-      doread (mtape->tapefd, byte, 4);  /* get trailing record length */
-      if((((unsigned long)byte[3]<<24L)|
-	  ((unsigned long)byte[2]<<16L)|
-	  ((unsigned long)byte[1]<<8)|
-	  (unsigned long)byte[0])!=l)
+      traillen = doread_u32(mtape->tapefd );  /* get trailing record length */
+      if(traillen != reclen)
 	{	/* should match */
-	  fprintf (stderr,"?Corrupt tape image\n");
+	  fprintf (stderr,"?Corrupt tape image");
+	  fprintf (stderr," reclen != traillen %lu != $%lu\n", reclen, traillen);
 	  exit(1);
 	}
     }
